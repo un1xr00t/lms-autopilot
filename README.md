@@ -39,14 +39,29 @@ Some platforms may need minor tweaks — see [Platform Notes](#platform-notes) b
 
 ## Setup
 
-### 1. Install Python dependencies
+### 1. Set up a virtual environment
+
+If pip complains about a protected environment (common on macOS and newer Linux distros), use a venv:
 
 ```bash
-pip3 install playwright anthropic
+python3 -m venv venv
+source venv/bin/activate        # macOS / Linux
+# venv\Scripts\activate.bat   # Windows Command Prompt
+# venv\Scripts\Activate.ps1   # Windows PowerShell
+```
+
+You'll see `(venv)` in your terminal prompt when it's active. Run this activation command each time you open a new terminal before using the agent.
+
+### 2. Install Python dependencies
+
+With your venv active:
+
+```bash
+pip install playwright anthropic
 python3 -m playwright install chromium
 ```
 
-### 2. Set environment variables
+### 3. Set environment variables
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
@@ -67,7 +82,7 @@ set ANTHROPIC_API_KEY=sk-ant-...
 set TRAINING_URL=https://your-lms.com
 ```
 
-### 3. Save your browser session (one time only)
+### 4. Save your browser session (one time only)
 
 This opens a browser for you to log in manually. **Your credentials are never stored or sent anywhere.**
 
@@ -81,7 +96,7 @@ python3 save_session.py
 - Come back to the terminal and press **Enter**
 - Your session cookies are saved to `browser-profile/`
 
-### 4. Run the agent
+### 5. Run the agent
 
 ```bash
 python3 agent.py
