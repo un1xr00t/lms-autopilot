@@ -111,9 +111,9 @@ Uses `claude-sonnet-4-6` by default (~$3/million input tokens).
 
 | Course length | Estimated cost |
 |---|---|
-| 1 hour | ~$1.00 |
-| 3 hours | ~$2.50 |
-| 7 hours | ~$5–8 |
+| Short (< 1 hour) | ~$0.50–1.00 |
+| Medium (1–3 hours) | ~$1.00–3.00 |
+| Long (3+ hours) | ~$3.00–8.00 |
 
 You can reduce cost further by increasing `CHECK_INTERVAL_SEC` (e.g. from 1 to 3).
 
