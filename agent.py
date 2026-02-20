@@ -9,6 +9,7 @@ import base64
 import os
 import json
 import sys
+import time as _time
 from playwright.async_api import async_playwright, Page, BrowserContext
 import anthropic
 
@@ -28,10 +29,28 @@ VIEWPORT_H          = 800
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+# ── Token Tracking ────────────────────────────────────────────────────────────
+_api_call_count = 0
+_total_input_tokens = 0
+_total_output_tokens = 0
+_total_cost = 0.0
+
+def _log_api_call(context: str, usage):
+    """Track API calls and token usage."""
+    global _api_call_count, _total_input_tokens, _total_output_tokens, _total_cost
+    _api_call_count += 1
+    input_tok = usage.input_tokens
+    output_tok = usage.output_tokens
+    cost = (input_tok * 3 / 1_000_000) + (output_tok * 15 / 1_000_000)
+    _total_input_tokens += input_tok
+    _total_output_tokens += output_tok
+    _total_cost += cost
+    print(f"[API #{_api_call_count}] {context} | in={input_tok} out={output_tok} cost=${cost:.4f} | TOTAL: ${_total_cost:.4f}")
+
 
 # ── Claude Vision ─────────────────────────────────────────────────────────────
 
-def analyze_screen(screenshot_bytes: bytes, hint: str = "") -> dict:
+def analyze_screen(screenshot_bytes: bytes, hint: str = "", context: str = "analyze") -> dict:
     """
     Ask Claude to analyze the screen and return coordinates to click.
     Returns pixel (x, y) for every action needed.
@@ -90,6 +109,9 @@ Be precise — click the CENTER of buttons, checkboxes, and arrows.
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}]
     )
+    
+    # Track token usage
+    _log_api_call(context, response.usage)
 
     raw = response.content[0].text.strip()
     # Strip markdown fences if present
@@ -209,7 +231,8 @@ async def wait_for_video_to_end(page: Page, clicked_items: set = None) -> bool:
             "popup_open (bool: is a modal/popup with X button visible?), "
             "popup_x (object with x,y of the X close button, or null), "
             "clicks (array of ALL interactive content items with label/x/y - include ALL blocks/tabs/buttons even if highlighted/visited, "
-            "EXCLUDE only: MENU, TRANSCRIPT, play/pause, volume, settings, < > player nav arrows).")
+            "EXCLUDE only: MENU, TRANSCRIPT, play/pause, volume, settings, < > player nav arrows).",
+            context="video_loop")
 
         state      = analysis.get("state", "video")
         popup_open = analysis.get("popup_open", False)
@@ -229,8 +252,14 @@ async def wait_for_video_to_end(page: Page, clicked_items: set = None) -> bool:
             if px and py:
                 print(f"[VIDEO] Closing popup at ({px},{py})")
                 await page.mouse.click(px, py)
+                await asyncio.sleep(0.3)
+                # Click a few more times with slight offsets in case first click missed
+                for dx, dy in [(-5, 0), (5, 0), (0, -5)]:
+                    await page.mouse.click(px + dx, py + dy)
+                    await asyncio.sleep(0.15)
             else:
-                for cx, cy in [(1366,278),(521,262),(491,281),(1399,230)]:
+                # LMS-specific fallback positions for close button
+                for cx, cy in [(608, 191), (609, 195), (600, 190), (610, 185)]:
                     await page.mouse.click(cx, cy)
                     await asyncio.sleep(0.2)
             await asyncio.sleep(0.8)
@@ -242,7 +271,11 @@ async def wait_for_video_to_end(page: Page, clicked_items: set = None) -> bool:
         if not new_clicks:
             stuck_count += 1
             if stuck_count >= 2:
-                print("[VIDEO] All interactions done — exiting.")
+                print("[VIDEO] All interactions done — trying next arrow before exiting.")
+                # Try common next arrow positions
+                for ax, ay in [(625, 537), (620, 535), (630, 540), (601, 339)]:
+                    await page.mouse.click(ax, ay)
+                    await asyncio.sleep(0.3)
                 return True
             continue
 
@@ -261,14 +294,18 @@ async def wait_for_video_to_end(page: Page, clicked_items: set = None) -> bool:
             await asyncio.sleep(1.2)
             # Quick screenshot to close any popup that appeared — reuse next cycle's call
             ss2 = await take_screenshot(page)
-            chk = analyze_screen(ss2, "Is a popup open? Return JSON: popup_open bool, popup_x with x and y ints.")
+            chk = analyze_screen(ss2, 
+                "Check if a modal/popup/overlay with an X close button is now visible. "
+                "Return JSON: popup_open (true if modal visible), popup_x (object with x,y of X button, or null).",
+                context="popup_check")
             if chk.get("popup_open"):
                 p2 = chk.get("popup_x") or {}
                 px2, py2 = p2.get("x"), p2.get("y")
                 if px2 and py2:
                     await page.mouse.click(px2, py2)
                 else:
-                    for cx, cy in [(1366,278),(521,262),(491,281)]:
+                    # LMS-specific fallback positions
+                    for cx, cy in [(608, 191), (609, 195), (600, 190)]:
                         await page.mouse.click(cx, cy)
                         await asyncio.sleep(0.2)
                 await asyncio.sleep(0.6)
@@ -279,6 +316,8 @@ async def wait_for_video_to_end(page: Page, clicked_items: set = None) -> bool:
 # ── Main Agent Loop ────────────────────────────────────────────────────────────
 
 async def run_agent():
+    start_time = _time.time()
+    
     if not os.path.exists(PROFILE_DIR):
         print(f"[ERROR] No browser profile at '{PROFILE_DIR}'.")
         print("  Run  python3 save_session.py  first.")
@@ -324,7 +363,7 @@ async def run_agent():
             page = await get_active_page(context, page)
 
             screenshot = await take_screenshot(page)
-            analysis   = analyze_screen(screenshot)
+            analysis   = analyze_screen(screenshot, context="main_loop")
             state      = analysis.get("state", "unknown")
             reasoning  = analysis.get("reasoning", "")
             clicks     = analysis.get("clicks", [])
@@ -341,17 +380,17 @@ async def run_agent():
                 if same_action_count >= max_same_action:
                     print(f"[AGENT] Stuck on same slide — trying all possible next arrows...")
                     # Try a series of known arrow/next-button hotspots across the player
+                    # Note: popup window is ~668x569, so coordinates are relative to that
                     arrow_candidates = [
                         (625, 537),  # bottom-right player nav arrow
-                        (640, 540),
-                        (615, 535),
-                        (601, 339),  # mid-slide arrow
-                        (620, 340),
-                        (580, 340),
-                        (650, 400),
-                        (630, 300),
-                        (640, 490),
-                        (660, 537),
+                        (620, 535),
+                        (630, 540),
+                        (640, 537),
+                        (601, 400),  # mid-slide area
+                        (620, 450),
+                        (600, 500),
+                        (334, 440),  # center area
+                        (589, 447),  # START button area
                     ]
                     for ax, ay in arrow_candidates:
                         print(f"[AGENT] Trying arrow at ({ax}, {ay})")
@@ -359,7 +398,7 @@ async def run_agent():
                         await asyncio.sleep(0.8)
                         # Take screenshot and check if slide changed
                         ss_check = await take_screenshot(page)
-                        check = analyze_screen(ss_check, "Did the slide advance? Is this a different slide now?")
+                        check = analyze_screen(ss_check, "Did the slide advance? Is this a different slide now?", context="stuck_check")
                         new_labels = [c.get("label","") for c in check.get("clicks", [])]
                         if new_labels != current_labels or check.get("state") != state:
                             print(f"[AGENT] Slide advanced after clicking ({ax}, {ay})!")
@@ -390,7 +429,8 @@ async def run_agent():
                     "The menu items are typically in the left 200px of the screen, spread vertically. "
                     "Return state='next_button' and the EXACT center coordinates of that unchecked module text link. "
                     "Do NOT click anywhere near y=0 to y=50 (that is the top bar, not the menu). "
-                    "Menu items are typically between y=100 and y=500.")
+                    "Menu items are typically between y=100 and y=500.",
+                    context="next_module_scan")
                 next_clicks = next_analysis.get("clicks", [])
                 print(f"[AGENT] Next module scan: {[c.get('label') for c in next_clicks]}")
 
@@ -418,7 +458,8 @@ async def run_agent():
 
             elif state == "video":
                 await wait_for_video_to_end(page, slide_clicked_items)
-                slide_clicked_items.clear()  # New slide — reset
+                # Don't clear clicked_items here - it causes re-clicking on same slide
+                # Items will naturally not match on new slides anyway
                 await asyncio.sleep(1)
 
             elif state in ("quiz", "next_button"):
@@ -437,7 +478,8 @@ async def run_agent():
                             "The quiz slide is still visible with answers checked. "
                             "Find the NEXT navigation arrow or button to advance to the next slide. "
                             "It is usually a right-facing arrow (>) at the right edge or bottom of the player. "
-                            "Return state='next_button' and the coordinates of that arrow.")
+                            "Return state='next_button' and the coordinates of that arrow.",
+                            context="post_quiz_nav")
                         nav_clicks = nav_analysis.get("clicks", [])
                         nav_state  = nav_analysis.get("state", "")
                         print(f"[NAV] Post-action scan: {nav_state} — {[c.get('label') for c in nav_clicks]}")
@@ -465,6 +507,18 @@ async def run_agent():
             await asyncio.sleep(CHECK_INTERVAL_SEC)
 
         await context.close()
+        
+        # Print final stats
+        elapsed_min = (_time.time() - start_time) / 60
+        print("\n" + "=" * 60)
+        print("[FINAL STATS]")
+        print(f"  Elapsed time:   {elapsed_min:.1f} minutes")
+        print(f"  API calls:      {_api_call_count}")
+        print(f"  Input tokens:   {_total_input_tokens:,}")
+        print(f"  Output tokens:  {_total_output_tokens:,}")
+        print(f"  Total cost:     ${_total_cost:.4f}")
+        print(f"  Cost/minute:    ${_total_cost/max(elapsed_min,0.1):.4f}")
+        print("=" * 60)
         print("[AGENT] Done.")
 
 
